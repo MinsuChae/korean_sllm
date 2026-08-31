@@ -5,11 +5,13 @@
 
 - {train,val}.jsonl 이 없으면 tar.xz 에서 자동으로 푼다 (data.py).
 - bf16 지원 GPU 는 bf16 autocast, 그 외 CUDA 는 fp16+GradScaler, CPU 는 fp32.
-- --ckpt-dir 에 주기 저장하며 --resume 으로 재개한다 (Google Drive 경로 가능).
+- --ckpt-dir 에 last.pt(--save-every 주기 최신)와 best.pt(val main_loss 최저)만 유지하고,
+  --resume 은 last.pt 로 재개한다 (Google Drive 경로 가능).
 """
 
 import argparse
 import math
+import os
 import time
 from pathlib import Path
 
@@ -36,9 +38,13 @@ def parse_args():
     p.add_argument("--ckpt-dir", default=str(ROOT / "checkpoints"))
     p.add_argument("--resume", default=None, help="재개할 체크포인트 경로")
     p.add_argument("--seq-len", type=int, default=None, help="기본: config.max_seq_len")
+    p.add_argument("--max-sample-len", type=int, default=None,
+                   help="이 토큰 길이를 넘는 샘플은 캐시에서 제외. 기본: seq_len 과 동일, 0 이면 제외하지 않음")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=20_000)
+    p.add_argument("--epochs", type=float, default=None,
+                   help="지정 시 max-steps 를 무시하고 데이터셋 윈도우 수에서 스텝을 환산 (권장: 4)")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--min-lr-ratio", type=float, default=0.1)
     p.add_argument("--warmup-steps", type=int, default=500)
@@ -89,10 +95,13 @@ def evaluate(model, loader, device, amp_dtype, max_batches: int) -> dict[str, fl
     return {k: v / max(n, 1) for k, v in sums.items()}
 
 
-def save_ckpt(path: Path, model, optim, step: int, cfg: ModelConfig):
+def save_ckpt(path: Path, model, optim, step: int, cfg: ModelConfig, best_val: float):
+    # 임시 파일에 쓴 뒤 교체 - Drive 위에서 덮어쓰기 도중 런타임이 끊겨도 기존 파일이 보존된다
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     torch.save({"model": model.state_dict(), "optim": optim.state_dict(),
-                "step": step, "config": cfg.to_dict()}, path)
+                "step": step, "config": cfg.to_dict(), "best_val": best_val}, tmp)
+    os.replace(tmp, path)
     print(f"[ckpt] step {step} -> {path}")
 
 
@@ -109,16 +118,26 @@ def main():
     assert sp.get_piece_size() == cfg.vocab_size, \
         f"토크나이저 vocab {sp.get_piece_size()} != config {cfg.vocab_size}"
 
-    train_ds = make_dataset(root, "train", seq_len, cache_dir, sp)
-    val_ds = make_dataset(root, "val", seq_len, cache_dir, sp)
+    # seq_len 보다 긴 샘플은 어차피 한 윈도우에 못 들어가므로 기본으로 제외한다 (--max-sample-len 0 으로 해제)
+    max_sample_len = seq_len if args.max_sample_len is None else (args.max_sample_len or None)
+    train_ds = make_dataset(root, "train", seq_len, cache_dir, sp, max_sample_len)
+    val_ds = make_dataset(root, "val", seq_len, cache_dir, sp, max_sample_len)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, drop_last=True, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, drop_last=True)
 
+    # 토크나이저·seq_len 이 바뀌면 1 epoch 스텝 수가 달라지므로 epoch 로 지정할 수 있게 한다
+    steps_per_epoch = max(len(train_ds) // (args.batch_size * args.grad_accum), 1)
+    if args.epochs is not None:
+        args.max_steps = max(round(args.epochs * steps_per_epoch), 1)
+    tokens_per_step = args.batch_size * args.grad_accum * seq_len
+
     model = KoreanSLLM(cfg).to(device)
-    print(f"모델: {cfg.n_layers}L d{cfg.d_model} | 파라미터 {model.num_params() / 1e6:.1f}M | "
+    print(f"모델: {cfg.n_layers}L d{cfg.d_model} v{cfg.vocab_size} | 파라미터 {model.num_params() / 1e6:.1f}M | "
           f"MTP {cfg.mtp_n}토큰 | device={device} | train {len(train_ds):,} windows(seq {seq_len})")
+    print(f"스케줄: {args.max_steps:,} steps × {tokens_per_step:,} tok/step "
+          f"= {args.max_steps * tokens_per_step / 1e9:.2f}B tokens ≈ {args.max_steps / steps_per_epoch:.1f} epochs")
 
     if args.grad_checkpointing:
         import functools
@@ -139,12 +158,14 @@ def main():
     print(f"정밀도: {amp_dtype or torch.float32}")
 
     step = 0
+    best_val = float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model"])
         optim.load_state_dict(ckpt["optim"])
         step = ckpt["step"]
-        print(f"[ckpt] {args.resume} 에서 step {step} 재개")
+        best_val = ckpt.get("best_val", float("inf"))  # 미복원 시 첫 eval 이 best.pt 를 덮어쓴다
+        print(f"[ckpt] {args.resume} 에서 step {step} 재개 (best val {best_val:.4f})")
 
     model.train()
     data_iter = iter(train_loader)
@@ -186,12 +207,18 @@ def main():
                   f"mtp {logs['mtp_loss']:.4f}) | lr {optim.param_groups[0]['lr']:.2e} | {tps / 1e3:.1f}k tok/s")
         if step % args.eval_every == 0:
             ev = evaluate(model, val_loader, device, amp_dtype, args.eval_batches)
+            mem = (f" | mem {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB"
+                   if device.type == "cuda" else "")
             print(f"  [val] main {ev['main_loss']:.4f} | mtp {ev['mtp_loss']:.4f} | "
-                  f"ppl {math.exp(min(ev['main_loss'], 20)):.1f}")
+                  f"ppl {math.exp(min(ev['main_loss'], 20)):.1f}{mem}")
+            if ev["main_loss"] < best_val:
+                best_val = ev["main_loss"]
+                print(f"  [ckpt] new best (val main {best_val:.4f})")
+                save_ckpt(ckpt_dir / "best.pt", model, optim, step, cfg, best_val)
         if step % args.save_every == 0 or step == args.max_steps:
-            save_ckpt(ckpt_dir / f"step{step:06d}.pt", model, optim, step, cfg)
+            save_ckpt(ckpt_dir / "last.pt", model, optim, step, cfg, best_val)
 
-    save_ckpt(ckpt_dir / "final.pt", model, optim, step, cfg)
+    print(f"학습 종료: last.pt step {step} | best.pt val main {best_val:.4f}")
 
     if args.sample:
         from data import encode_sample

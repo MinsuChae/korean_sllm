@@ -6,7 +6,8 @@
   - sliding-window local : global 어텐션 5:1 교차 배치
   - GeGLU MLP, 임베딩 sqrt(d) 스케일링, 입출력 임베딩 tying
   - MTP: 공유 경량 블록 + offset별 임베딩 -> tied unembedding 으로
-    offset 1..mtp_n 의 미래 토큰을 병렬 예측 (학습 전용, 추론 시 미사용)
+    offset 1..mtp_n 의 미래 토큰을 병렬 예측. 학습 보조 손실로 쓰이고,
+    추론에서는 generate_speculative 의 draft 생성기로 재활용된다.
 
 forward(input_ids, loss_mask) 는 내부에서 라벨을 시프트해
 main CE / MTP CE 를 계산한다. loss_mask[t]==1 인 위치의 토큰만 학습 대상.
@@ -22,7 +23,7 @@ import torch.nn.functional as F
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 10240
+    vocab_size: int = 32768  # tokenizer/spm.model 과 일치해야 함 (docs/model_config_review.md)
     n_layers: int = 24
     d_model: int = 768
     n_heads: int = 12
@@ -147,7 +148,10 @@ class Block(nn.Module):
 
 
 class MTPHead(nn.Module):
-    """공유 GeGLU 블록 + offset별 임베딩. 로짓은 tied unembedding 으로 계산."""
+    """공유 GeGLU 블록 + offset별 임베딩. 로짓은 tied unembedding 으로 계산.
+
+    학습 보조 손실 외에, 추론에서는 generate_speculative 의 draft 생성에 쓰인다.
+    """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -173,6 +177,32 @@ class KVCache:
             self.k = torch.cat([self.k, k], dim=2)
             self.v = torch.cat([self.v, v], dim=2)
         return self.k, self.v
+
+    def truncate(self, n: int):
+        """앞쪽 n 개 위치만 남긴다 (speculative decoding 에서 거부된 draft 제거용)."""
+        if self.k is not None:
+            self.k = self.k[:, :, :n]
+            self.v = self.v[:, :, :n]
+
+
+def _warped_probs(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    """temperature + top-p 를 적용한 샘플링 분포 (B, V). temperature<=0 이면 argmax one-hot.
+
+    speculative rejection sampling 은 target/draft 양쪽에 같은 warping 을 적용해야
+    분포가 보존되므로, 샘플 하나가 아니라 분포 전체를 반환한다.
+    """
+    if temperature <= 0:
+        return torch.zeros_like(logits).scatter_(-1, logits.argmax(-1, keepdim=True), 1.0)
+    probs = F.softmax(logits / temperature, dim=-1)
+    sorted_probs, sorted_idx = probs.sort(descending=True)
+    cum = sorted_probs.cumsum(-1)
+    sorted_probs[cum - sorted_probs > top_p] = 0.0
+    sorted_probs /= sorted_probs.sum(-1, keepdim=True)
+    return torch.zeros_like(probs).scatter_(-1, sorted_idx, sorted_probs)
+
+
+def _sample_token(probs: torch.Tensor, temperature: float) -> torch.Tensor:
+    return probs.argmax(-1, keepdim=True) if temperature <= 0 else torch.multinomial(probs, 1)
 
 
 class KoreanSLLM(nn.Module):
@@ -268,17 +298,99 @@ class KoreanSLLM(nn.Module):
         h = self._trunk(ids, kv_caches, pos_offset=0)
         for _ in range(max_new_tokens):
             logits = self.logits_from_hidden(h[:, -1]).float()
-            if temperature <= 0:
-                next_id = logits.argmax(-1, keepdim=True)
-            else:
-                probs = F.softmax(logits / temperature, dim=-1)
-                sorted_probs, sorted_idx = probs.sort(descending=True)
-                cum = sorted_probs.cumsum(-1)
-                sorted_probs[cum - sorted_probs > top_p] = 0.0
-                sorted_probs /= sorted_probs.sum(-1, keepdim=True)
-                next_id = sorted_idx.gather(-1, torch.multinomial(sorted_probs, 1))
+            next_id = _sample_token(_warped_probs(logits, temperature, top_p), temperature)
             ids = torch.cat([ids, next_id], dim=1)
             if (next_id == self.cfg.eos_id).all() or ids.shape[1] >= self.cfg.max_seq_len:
                 break
             h = self._trunk(next_id, kv_caches, pos_offset=ids.shape[1] - 1)
         return ids
+
+    @torch.inference_mode()
+    def generate_speculative(self, input_ids: torch.Tensor, max_new_tokens: int = 256,
+                             temperature: float = 0.8, top_p: float = 0.95,
+                             draft_k: int = 8, return_stats: bool = False):
+        """MTP 헤드를 draft 로 쓰는 self-speculative decoding (batch=1 전용).
+
+        마지막 확정 위치의 트렁크 hidden 에 mtp_head 를 offset 1..k 로 적용해
+        draft 토큰을 뽑고, [보류 토큰 x, draft k개] 를 트렁크 한 번의 forward 로
+        병렬 검증한다. greedy(temperature<=0) 는 generate 와 동일한 출력을 내고,
+        샘플링은 rejection sampling 으로 동일 분포를 보존한다.
+
+        return_stats=True 면 (ids, {"proposed": [...], "accepted": [...]}) 를 반환
+        (offset별 draft 시도/수용 횟수 — draft_k 튜닝용).
+        """
+        assert input_ids.shape[0] == 1, "generate_speculative 는 batch=1 만 지원"
+        self.eval()
+        cfg = self.cfg
+        kv_caches = [KVCache() for _ in self.blocks]
+        ids = input_ids
+        prompt_len = ids.shape[1]
+        stats = {"proposed": [0] * cfg.mtp_n, "accepted": [0] * cfg.mtp_n}
+
+        h = self._trunk(ids, kv_caches, pos_offset=0)
+        h_last = h[:, -1]
+        # x: 샘플은 됐지만 아직 트렁크를 통과(=확정)하지 않은 다음 토큰
+        x = _sample_token(_warped_probs(self.logits_from_hidden(h_last).float(),
+                                        temperature, top_p), temperature)
+
+        while True:
+            remaining = min(max_new_tokens - (ids.shape[1] - prompt_len),
+                            cfg.max_seq_len - ids.shape[1])
+            if remaining <= 0:
+                break
+            if x.item() == cfg.eos_id or remaining == 1:
+                ids = torch.cat([ids, x], dim=1)
+                break
+
+            k = min(draft_k, cfg.mtp_n, remaining - 1)
+            d_tokens, q_probs = [], []
+            for j in range(k):
+                hj = self.mtp_head(h_last.unsqueeze(1), offset_idx=j)
+                qj = _warped_probs(self.logits_from_hidden(hj[:, 0]).float(), temperature, top_p)
+                d_tokens.append(_sample_token(qj, temperature))
+                q_probs.append(qj)
+                stats["proposed"][j] += 1
+
+            # 검증: [x, d_1..d_k] 를 한 번에 통과. 위치 j 의 로짓이 d_{j+1} 자리의 target 분포.
+            chunk = torch.cat([x] + d_tokens, dim=1)
+            hv = self._trunk(chunk, kv_caches, pos_offset=ids.shape[1])
+            tlogits = self.logits_from_hidden(hv).float()
+
+            a = 0  # 수용된 draft 개수
+            if temperature <= 0:
+                for j in range(k):
+                    if d_tokens[j].item() != tlogits[:, j].argmax(-1).item():
+                        break
+                    a += 1
+                x_next = tlogits[:, a].argmax(-1, keepdim=True)
+            else:
+                x_next = None
+                for j in range(k):
+                    pj = _warped_probs(tlogits[:, j], temperature, top_p)
+                    d = d_tokens[j]
+                    pd, qd = pj.gather(-1, d).item(), q_probs[j].gather(-1, d).item()
+                    if torch.rand(()).item() * qd < pd:
+                        a += 1
+                        continue
+                    residual = (pj - q_probs[j]).clamp_min(0.0)
+                    denom = residual.sum(-1, keepdim=True)
+                    x_next = (torch.multinomial(residual / denom, 1) if denom.item() > 0
+                              else _sample_token(pj, temperature))
+                    break
+                if x_next is None:  # 전부 수용 -> 마지막 위치에서 보너스 토큰
+                    x_next = _sample_token(_warped_probs(tlogits[:, k], temperature, top_p),
+                                           temperature)
+            for j in range(a):
+                stats["accepted"][j] += 1
+
+            kept = [x] + d_tokens[:a]
+            cut = next((i + 1 for i, t in enumerate(kept) if t.item() == cfg.eos_id), len(kept))
+            ids = torch.cat([ids] + kept[:cut], dim=1)
+            if cut < len(kept) or kept[cut - 1].item() == cfg.eos_id:
+                break
+            for c in kv_caches:  # 거부된 draft 의 k/v 제거 (필수: 캐시 오염 방지)
+                c.truncate(ids.shape[1])
+            h_last = hv[:, a]
+            x = x_next
+
+        return (ids, stats) if return_stats else ids
