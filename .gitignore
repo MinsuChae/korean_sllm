@@ -1,0 +1,11 @@
+.claude
+.venv
+data/
+train/
+val/
+train.jsonl
+val.jsonl
+__pycache__/
+*.pyc
+checkpoints/
+cache/
