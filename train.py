@@ -10,6 +10,7 @@
 """
 
 import argparse
+import hashlib
 import math
 import os
 import time
@@ -36,7 +37,10 @@ def parse_args():
     p.add_argument("--data-dir", default=str(ROOT))
     p.add_argument("--cache-dir", default=str(ROOT / "cache"))
     p.add_argument("--ckpt-dir", default=str(ROOT / "checkpoints"))
-    p.add_argument("--resume", default=None, help="재개할 체크포인트 경로")
+    p.add_argument("--stage", choices=("sft", "pretrain"), default="sft")
+    checkpoint = p.add_mutually_exclusive_group()
+    checkpoint.add_argument("--resume", default=None, help="동일 단계의 모델/옵티마이저/스텝 복원")
+    checkpoint.add_argument("--init-from", default=None, help="사전학습 모델 가중치만 복원; 새 스케줄 시작")
     p.add_argument("--seq-len", type=int, default=None, help="기본: config.max_seq_len")
     p.add_argument("--max-sample-len", type=int, default=None,
                    help="이 토큰 길이를 넘는 샘플은 캐시에서 제외. 기본: seq_len 과 동일, 0 이면 제외하지 않음")
@@ -95,12 +99,15 @@ def evaluate(model, loader, device, amp_dtype, max_batches: int) -> dict[str, fl
     return {k: v / max(n, 1) for k, v in sums.items()}
 
 
-def save_ckpt(path: Path, model, optim, step: int, cfg: ModelConfig, best_val: float):
+def save_ckpt(path: Path, model, optim, step: int, cfg: ModelConfig, best_val: float,
+              stage: str, tokenizer_sha256: str, scaler=None):
     # 임시 파일에 쓴 뒤 교체 - Drive 위에서 덮어쓰기 도중 런타임이 끊겨도 기존 파일이 보존된다
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     torch.save({"model": model.state_dict(), "optim": optim.state_dict(),
-                "step": step, "config": cfg.to_dict(), "best_val": best_val}, tmp)
+                "step": step, "config": cfg.to_dict(), "best_val": best_val,
+                "stage": stage, "tokenizer_sha256": tokenizer_sha256,
+                "scaler": scaler.state_dict() if scaler else None}, tmp)
     os.replace(tmp, path)
     print(f"[ckpt] step {step} -> {path}")
 
@@ -110,22 +117,54 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    cfg = ModelConfig(**PRESETS[args.preset])
+    if args.init_from and args.stage != "sft":
+        raise ValueError("--init-from은 pretrain -> sft 전환에 사용하세요.")
+    ckpt = None
+    checkpoint_path = args.resume or args.init_from
+    if checkpoint_path:
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        expected_stage = "pretrain" if args.init_from else args.stage
+        if ckpt.get("stage", "sft") != expected_stage:
+            raise ValueError("체크포인트 단계 불일치: pretrain -> sft에는 --init-from을 사용하세요.")
+        if args.init_from and Path(args.ckpt_dir).resolve() == Path(args.init_from).resolve().parent:
+            raise ValueError("SFT 출력 폴더는 사전학습 체크포인트 폴더와 분리하세요.")
+    cfg = ModelConfig(**ckpt["config"]) if ckpt else ModelConfig(**PRESETS[args.preset])
     seq_len = args.seq_len or cfg.max_seq_len
+    if not 2 <= seq_len <= cfg.max_seq_len:
+        raise ValueError(f"seq-len은 2..{cfg.max_seq_len} 범위여야 합니다.")
+    if min(args.batch_size, args.grad_accum, args.eval_every, args.save_every,
+           args.eval_batches, args.log_every, args.max_steps) < 1:
+        raise ValueError("배치/스텝/주기 값은 양수여야 합니다.")
+    if args.epochs is not None and args.epochs <= 0:
+        raise ValueError("epochs는 양수여야 합니다.")
     root, cache_dir, ckpt_dir = Path(args.data_dir), Path(args.cache_dir), Path(args.ckpt_dir)
 
     sp = load_tokenizer()
+    tokenizer_sha256 = hashlib.sha256(sp.serialized_model_proto()).hexdigest()
+    if ckpt:
+        saved_hash = ckpt.get("tokenizer_sha256")
+        if args.init_from and not saved_hash:
+            raise ValueError("토크나이저 해시가 있는 새 pretrain 체크포인트가 필요합니다.")
+        if saved_hash and saved_hash != tokenizer_sha256:
+            raise ValueError("토크나이저가 체크포인트와 다릅니다. 사전학습 때의 spm.model을 사용하세요.")
     assert sp.get_piece_size() == cfg.vocab_size, \
         f"토크나이저 vocab {sp.get_piece_size()} != config {cfg.vocab_size}"
 
     # seq_len 보다 긴 샘플은 어차피 한 윈도우에 못 들어가므로 기본으로 제외한다 (--max-sample-len 0 으로 해제)
     max_sample_len = seq_len if args.max_sample_len is None else (args.max_sample_len or None)
-    train_ds = make_dataset(root, "train", seq_len, cache_dir, sp, max_sample_len)
-    val_ds = make_dataset(root, "val", seq_len, cache_dir, sp, max_sample_len)
+    if args.stage == "pretrain":
+        from pretrain_data import make_pretrain_dataset
+        train_ds = make_pretrain_dataset(root, "train", seq_len, cache_dir, sp)
+        val_ds = make_pretrain_dataset(root, "val", seq_len, cache_dir, sp)
+    else:
+        train_ds = make_dataset(root, "train", seq_len, cache_dir, sp, max_sample_len)
+        val_ds = make_dataset(root, "val", seq_len, cache_dir, sp, max_sample_len)
+    if len(train_ds) < args.batch_size or len(val_ds) == 0:
+        raise ValueError("학습 데이터가 한 배치 미만이거나 검증 데이터가 비었습니다. 데이터/seq-len/batch-size를 확인하세요.")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, drop_last=True, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                            num_workers=args.num_workers, drop_last=True)
+                            num_workers=args.num_workers, drop_last=False)
 
     # 토크나이저·seq_len 이 바뀌면 1 epoch 스텝 수가 달라지므로 epoch 로 지정할 수 있게 한다
     steps_per_epoch = max(len(train_ds) // (args.batch_size * args.grad_accum), 1)
@@ -141,10 +180,11 @@ def main():
 
     if args.grad_checkpointing:
         import functools
+        from torch.utils.checkpoint import checkpoint as checkpoint_forward
         for block in model.blocks:
             block._orig_forward = block.forward
             block.forward = functools.partial(
-                torch.utils.checkpoint.checkpoint, block._orig_forward, use_reentrant=False)
+                checkpoint_forward, block._orig_forward, use_reentrant=False)
 
     decay, no_decay = [], []
     for name, param in model.named_parameters():
@@ -159,13 +199,18 @@ def main():
 
     step = 0
     best_val = float("inf")
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+    if ckpt:
         model.load_state_dict(ckpt["model"])
+    if args.init_from:
+        print(f"[init] {args.init_from}: 모델 구조/가중치 복원, optimizer/step/best_val 초기화")
+    if args.resume:
         optim.load_state_dict(ckpt["optim"])
+        if scaler and ckpt.get("scaler"):
+            scaler.load_state_dict(ckpt["scaler"])
         step = ckpt["step"]
         best_val = ckpt.get("best_val", float("inf"))  # 미복원 시 첫 eval 이 best.pt 를 덮어쓴다
         print(f"[ckpt] {args.resume} 에서 step {step} 재개 (best val {best_val:.4f})")
+    del ckpt
 
     model.train()
     data_iter = iter(train_loader)
@@ -205,7 +250,7 @@ def main():
             tps = tokens_seen / (time.time() - t0)
             print(f"step {step:6d} | loss {logs['loss']:.4f} (main {logs['main_loss']:.4f} "
                   f"mtp {logs['mtp_loss']:.4f}) | lr {optim.param_groups[0]['lr']:.2e} | {tps / 1e3:.1f}k tok/s")
-        if step % args.eval_every == 0:
+        if step % args.eval_every == 0 or step == args.max_steps:
             ev = evaluate(model, val_loader, device, amp_dtype, args.eval_batches)
             mem = (f" | mem {torch.cuda.max_memory_allocated() / 2**30:.1f}GiB"
                    if device.type == "cuda" else "")
@@ -214,9 +259,11 @@ def main():
             if ev["main_loss"] < best_val:
                 best_val = ev["main_loss"]
                 print(f"  [ckpt] new best (val main {best_val:.4f})")
-                save_ckpt(ckpt_dir / "best.pt", model, optim, step, cfg, best_val)
+                save_ckpt(ckpt_dir / "best.pt", model, optim, step, cfg, best_val,
+                          args.stage, tokenizer_sha256, scaler)
         if step % args.save_every == 0 or step == args.max_steps:
-            save_ckpt(ckpt_dir / "last.pt", model, optim, step, cfg, best_val)
+            save_ckpt(ckpt_dir / "last.pt", model, optim, step, cfg, best_val,
+                      args.stage, tokenizer_sha256, scaler)
 
     print(f"학습 종료: last.pt step {step} | best.pt val main {best_val:.4f}")
 
