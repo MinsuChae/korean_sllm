@@ -52,29 +52,32 @@ python train.py --preset tiny --max-steps 30 --batch-size 2 --grad-accum 1 --eva
 ## 일반 텍스트 사전학습 → 인스트럭션 학습
 
 1. [colab_pretrain.ipynb](colab_pretrain.ipynb)를 Colab GPU에서 실행합니다.
-   Drive의 `korean_sllm_data/pretrain/{train,val}.jsonl`에 `{"text": "문서 본문"}` 데이터를 준비하세요.
+   Drive의 `korean_sllm_data/pretrain/pretrain_{train,val}.json`에 `["문서 본문", ...]` 데이터를 준비하세요.
    문서 단위로 train/val을 분리하고 중복을 제거하세요. 사전학습 코퍼스는 별도로 준비해야 합니다.
-2. 사전학습 결과는 `MyDrive/korean_sllm_pretrain/{best.pt,last.pt,spm.model}`에 저장됩니다.
+2. 사전학습 결과는 `MyDrive/korean_sllm_data/pretrain/{best.pt,last.pt,spm.model}`에 저장됩니다.
 3. [colab_train_think_weight_01.ipynb](colab_train_think_weight_01.ipynb)를 실행합니다.
    SFT 데이터는 `korean_sllm_data/sft/{train,val}.jsonl`의 `{"user": "질문", "assistant": "답변"}` 형식입니다.
    사전학습 `best.pt`의 모델 구조와 가중치를 읽고 optimizer/step/best loss를 초기화합니다.
    기존 think 내부 weight=0.1을 유지하며 결과는 `MyDrive/korean_sllm_sft`에 저장됩니다.
 
-두 노트북에는 변경된 학습 스크립트가 포함되어 있어 GitHub에 변경사항을 올리기 전에도 실행할 수 있습니다.
+사전학습 노트북은 저장소의 `train_pretrain.py`와 `pretrain_data.py`를 직접 사용합니다.
+이 파일들과 노트북 변경사항을 함께 GitHub에 올린 뒤 Colab에서 실행하세요.
+SFT 노트북에는 변경된 학습 스크립트가 포함되어 있습니다.
 모델 구조와 MTP 16개는 동일하며, 토크나이저 파일을 두 단계 사이에서 바꾸지 마세요.
 체크포인트의 토크나이저 SHA-256으로 호환성을 검사합니다.
 
 공용 스크립트의 로컬 사용 예:
 
 ```bash
-python train.py --stage pretrain --data-dir ./pretrain_corpus --ckpt-dir ./checkpoints/pretrain --epochs 1
+python train_pretrain.py --data-dir ./pretrain_corpus --ckpt-dir ./checkpoints/pretrain --epochs 5 --session-epochs 0.25
 python train.py --stage sft --init-from ./checkpoints/pretrain/best.pt --ckpt-dir ./checkpoints/sft --lr 5e-5 --epochs 2
 python train.py --stage sft --resume ./checkpoints/sft/last.pt --ckpt-dir ./checkpoints/sft --lr 5e-5 --epochs 3
 ```
 
 로컬 `train.py`의 SFT는 기존 assistant 마스킹을 사용합니다. think 가중치 0.1은 SFT 노트북의 패치 셀에서 적용됩니다.
 `--init-from`과 `--resume`은 동시에 사용할 수 없습니다. 재개 시 데이터, 배치, LR 설정도 이전 실행과 맞추세요.
-재개는 모델/옵티마이저/스텝/AMP scaler를 복원하지만 데이터 순서와 RNG 상태까지 동일하게 복원하지는 않습니다.
+사전학습은 모델/옵티마이저/스케줄/데이터 위치/RNG 상태를 복원하며, 노트북을 같은 출력 폴더로 실행하면 0.25epoch씩 총 5epoch까지 이어갑니다.
+SFT 재개는 모델/옵티마이저/스텝/AMP scaler를 복원하지만 데이터 순서와 RNG 상태까지 동일하게 복원하지는 않습니다.
 사전학습 캐시는 원문과 토크나이저 해시로 구분하고, 긴 문서도 버리지 않고 패킹합니다.
 사전학습은 모든 다음 토큰을 학습하며 문서 사이 attention을 허용합니다.
 성능은 데이터 품질·양과 학습량에 따라 달라지므로 SFT-only 기준 모델과 동일한 평가셋에서 비교하세요.
